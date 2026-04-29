@@ -1,0 +1,37 @@
+{
+  "_comment_1": "Copy this file to config.json and fill in your TMDB API key.",
+  "_comment_2": "The tmdb_api_key should be the v3 auth key (32-char hex), NOT the v4 bearer token.",
+  "_comment_3": "Paths are Windows-style with forward slashes OR escaped backslashes.",
+  "_comment_4": "Phase 1 keys are above the blank line; phase 3 keys are below.",
+
+  "tmdb_api_key": "REPLACE_ME",
+
+  "movies_root":     "H:/Movies",
+  "mediaprep_dir":   "H:/_mediaprep",
+  "duplicates_dir":  "H:/duplicates",
+
+  "language": "en-US",
+
+  "strip_collection_suffix": true,
+
+  "hash_algo": "blake3",
+
+  "extras_size_threshold_mb": 500,
+
+  "confidence_auto":   75,
+  "confidence_review": 30,
+
+
+  "_comment_phase3": "===== Phase 3 (execute.py) keys =====",
+
+  "extras_subfolder": "Extras",
+  "duplicates_root": "H:/duplicates",
+  "nfo_format": "kodi",
+  "nfo_overwrite_policy": "backup-on-conflict",
+  "nfo_richness": "rich",
+  "filename_template": "{title} ({year}) {{imdb-{imdb_id}}}",
+  "long_path_prefix": true,
+  "rmdir_empty_sources": true,
+  "verify_hashes_default": false,
+  "large_extra_threshold_mb": 500
+}

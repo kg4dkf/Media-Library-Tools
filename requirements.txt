@@ -1,0 +1,5 @@
+requests>=2.31
+tqdm>=4.66
+blake3>=0.4
+guessit>=3.8
+lxml>=4.9
