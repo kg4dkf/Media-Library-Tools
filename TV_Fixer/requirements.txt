@@ -1,0 +1,8 @@
+faster-whisper>=1.0.0
+guessit>=3.8.0
+openpyxl>=3.1.0
+requests>=2.31.0
+send2trash>=1.8.0
+srt>=3.5.3
+tqdm>=4.66.0
+yt-dlp>=2024.0.0
