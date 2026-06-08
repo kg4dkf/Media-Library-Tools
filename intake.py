@@ -69,6 +69,8 @@ from execute import (  # type: ignore
     sanitize_for_windows,
 )
 
+import subprocess
+
 try:
     import requests  # type: ignore
     _HAS_REQUESTS = True
@@ -116,6 +118,284 @@ def denoise_filename(stem: str) -> str:
     s = re.sub(r"[\._]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s or stem
+
+
+# ---------------------------------------------------------------------------
+# Edition / 3D variant detection
+#
+# Recognize Plex-style edition markers and 3D format tags in source
+# filenames so two variants of the same movie (Theatrical + Extended,
+# or 2D + 3D) can coexist in the same folder. The detector strips the
+# markers from the stem so the TMDB lookup sees a clean title.
+# ---------------------------------------------------------------------------
+
+# Plex's own explicit edition tag — trust the user's choice verbatim.
+_PLEX_EDITION_RX = re.compile(r"\{edition-([^}]+)\}", re.IGNORECASE)
+
+# Generic edition keywords. Order matters: longer/more-specific phrases
+# must come before their substrings (e.g. "Extended Director's Cut" before
+# "Director's Cut" before "Extended").
+_EDITION_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bExtended[\s_\.]+Director'?s[\s_\.]+Cut\b", re.I), "Extended Director's Cut"),
+    (re.compile(r"\bDirector'?s[\s_\.]+Cut\b",                 re.I), "Director's Cut"),
+    (re.compile(r"\bUltimate[\s_\.]+Edition\b",                re.I), "Ultimate Edition"),
+    (re.compile(r"\bSpecial[\s_\.]+Edition\b",                 re.I), "Special Edition"),
+    (re.compile(r"\bExtended[\s_\.]+Edition\b",                re.I), "Extended"),
+    (re.compile(r"\bExtended[\s_\.]+Cut\b",                    re.I), "Extended Cut"),
+    (re.compile(r"\bTheatrical[\s_\.]+Cut\b",                  re.I), "Theatrical Cut"),
+    (re.compile(r"\bFinal[\s_\.]+Cut\b",                       re.I), "Final Cut"),
+    (re.compile(r"\bRemastered\b",                             re.I), "Remastered"),
+    (re.compile(r"\bUnrated\b",                                re.I), "Unrated"),
+    (re.compile(r"\bExtended\b",                               re.I), "Extended"),
+    (re.compile(r"\bTheatrical\b",                             re.I), "Theatrical"),
+]
+
+# 3D format tags. Plain "3D" with no format is assumed HSBS (most common
+# output of MakeMKV/Handbrake 3D encodes). Plain "SBS"/"OU" without "3D"
+# context is NOT enough — too ambiguous against English words.
+_THREED_FORMAT_RX = re.compile(r"\b(HSBS|FSBS|HOU|FOU)\b", re.I)
+_THREED_MARKER_RX = re.compile(r"\b3D\b", re.I)
+
+# Extras suffix — matches "Extra", "Extras", "Extra 2", "Extras 3" at the
+# tail end of a stem. Picked up AFTER variant detection so it lives in
+# its own dataclass.
+_EXTRA_RX = re.compile(r"\bExtras?(?:\s+(\d+))?\s*$", re.IGNORECASE)
+
+
+def _smart_title(s: str) -> str:
+    """Title-case that preserves apostrophe-S (so "director's cut" becomes
+    "Director's Cut", not "Director'S Cut" like str.title() would give).
+    """
+    return re.sub(r"(\w)'(\w)",
+                  lambda m: m.group(1) + "'" + m.group(2).lower(),
+                  s.title())
+
+
+@dataclass
+class VariantTags:
+    edition: str = ""
+    is_3d: bool = False
+    threed_format: str = ""
+    cleaned_stem: str = ""   # stem with markers stripped, safe for TMDB lookup
+
+
+def detect_variants(stem: str) -> VariantTags:
+    """Identify edition + 3D markers in a source filename stem.
+
+    Returns the detected tags along with a 'cleaned_stem' that has the
+    markers removed — feed that to guessit/TMDB so the title parsing
+    doesn't think the marker is part of the title.
+    """
+    v = VariantTags(cleaned_stem=stem)
+    work = stem
+
+    # 1. Explicit Plex tag {edition-X} (highest precedence). Normalize
+    # casing to title case so "{edition-extended}" written by the user
+    # ends up as "{edition-Extended}" in the canonical filename.
+    m = _PLEX_EDITION_RX.search(work)
+    if m:
+        v.edition = _smart_title(m.group(1).replace("_", " ").strip())
+        work = _PLEX_EDITION_RX.sub(" ", work)
+    else:
+        # 2. Generic edition keywords.
+        for rx, label in _EDITION_PATTERNS:
+            if rx.search(work):
+                v.edition = label
+                work = rx.sub(" ", work)
+                break
+
+    # 3. 3D format tags.
+    m = _THREED_FORMAT_RX.search(work)
+    if m:
+        v.threed_format = m.group(1).upper()
+        v.is_3d = True
+        work = _THREED_FORMAT_RX.sub(" ", work)
+    if _THREED_MARKER_RX.search(work):
+        v.is_3d = True
+        if not v.threed_format:
+            v.threed_format = "HSBS"  # MakeMKV/Handbrake default for 3D rips
+        work = _THREED_MARKER_RX.sub(" ", work)
+
+    # Normalize internal whitespace. Hyphens are preserved (they may be
+    # part of an imdb/tmdb tag like {imdb-tt0499549}) — denoise_filename
+    # handles further cleanup before guessit runs.
+    work = re.sub(r"[\s\._]+", " ", work).strip(" -_.")
+    v.cleaned_stem = work or stem
+    return v
+
+
+@dataclass
+class ExtraTags:
+    is_extra: bool = False
+    extra_label: str = ""        # canonical label: "Extra", "Extras", "Extra 2", ...
+    cleaned_stem: str = ""       # stem with the trailing extras marker removed
+
+
+def detect_extra(stem: str) -> ExtraTags:
+    """Detect "Extra" / "Extras" / "Extra N" at the END of a stem.
+
+    The trailing position matters: we don't want "Extra Edition" or a
+    movie literally titled "Extra Ordinary" being misclassified. Only a
+    tail-position marker (just before the file extension) is treated as
+    "this video is a bonus feature of the main movie".
+    """
+    e = ExtraTags(cleaned_stem=stem)
+    m = _EXTRA_RX.search(stem)
+    if not m:
+        return e
+    e.is_extra = True
+    num = m.group(1)
+    matched = m.group(0).strip()
+    plural = matched.lower().startswith("extras")
+    if num:
+        # "Extra 2" / "Extras 2" → "Extra 2" (singular form looks cleaner
+        # when numbered).
+        e.extra_label = f"Extra {num}"
+    else:
+        # Preserve the user's choice of "Extra" vs "Extras" when unnumbered.
+        e.extra_label = "Extras" if plural else "Extra"
+    e.cleaned_stem = _EXTRA_RX.sub("", stem).strip(" -_.")
+    return e
+
+
+def template_for_variant(base_template: str, edition: str,
+                         is_3d: bool, threed_format: str) -> str:
+    """Add Plex {edition-X} and ' - 3D.FMT' tags to a filename template.
+
+    The edition tag is inserted BEFORE the imdb/tmdb tag (Plex prefers
+    that order for its scanner). The 3D format suffix is appended at
+    the very end, just before the extension is added by the caller.
+    """
+    out = base_template
+    if edition:
+        edition_tag = "{{edition-" + edition + "}}"
+        # The base template ends with "{{imdb-...}}" or "{{tmdb-...}}".
+        # Insert the edition tag immediately before that final id tag.
+        anchor = out.rfind("{{")
+        if anchor > 0:
+            out = out[:anchor] + edition_tag + " " + out[anchor:]
+        else:
+            out = out + " " + edition_tag
+    if is_3d:
+        out = out + " - 3D." + (threed_format or "HSBS")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Quality probe — ffprobe a video file and return its quality fingerprint
+# ---------------------------------------------------------------------------
+
+def ffprobe_video_quality(path: Path, timeout: int = 60) -> Optional[Dict[str, Any]]:
+    """Return {width, height, codec, bit_rate, duration_s, size_bytes}, or None."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,codec_name,bit_rate:format=duration,bit_rate,size",
+        "-of", "json",
+        long(path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    streams = data.get("streams") or [{}]
+    fmt = data.get("format") or {}
+    s = streams[0] if streams else {}
+    try:
+        size_bytes = int(fmt.get("size", 0) or 0) or os.path.getsize(long(path))
+    except OSError:
+        size_bytes = 0
+    try:
+        duration_s = float(fmt.get("duration") or 0)
+    except (ValueError, TypeError):
+        duration_s = 0.0
+    try:
+        bit_rate = int(s.get("bit_rate") or fmt.get("bit_rate") or 0)
+    except (ValueError, TypeError):
+        bit_rate = 0
+    # If bit_rate is missing, derive from size + duration
+    if not bit_rate and duration_s > 0:
+        bit_rate = int((size_bytes * 8) / duration_s)
+    try:
+        width = int(s.get("width") or 0)
+        height = int(s.get("height") or 0)
+    except (ValueError, TypeError):
+        width = height = 0
+    return {
+        "width": width,
+        "height": height,
+        "codec": s.get("codec_name", "") or "",
+        "bit_rate": bit_rate,
+        "duration_s": duration_s,
+        "size_bytes": size_bytes,
+    }
+
+
+def quality_score(info: Dict[str, Any]) -> Tuple[int, int, int]:
+    """Score tuple for sorting; higher is better."""
+    pixels = (info.get("width", 0) or 0) * (info.get("height", 0) or 0)
+    return (pixels, info.get("bit_rate", 0) or 0, info.get("size_bytes", 0) or 0)
+
+
+def quality_summary(info: Optional[Dict[str, Any]]) -> str:
+    if not info:
+        return "(ffprobe failed)"
+    w = info.get("width", 0)
+    h = info.get("height", 0)
+    codec = info.get("codec") or "?"
+    kbps = (info.get("bit_rate", 0) or 0) // 1000
+    mb = (info.get("size_bytes", 0) or 0) / (1024 * 1024)
+    return f"{w}x{h} {codec} {kbps} kbps, {mb:.0f} MB"
+
+
+# Quality decision constants
+QUALITY_KEEP_EXISTING = "keep_existing"   # new file → duplicates
+QUALITY_REPLACE       = "replace"          # existing → duplicates, new in
+QUALITY_UNDECIDED     = "undecided"        # ffprobe failed; fall back to skip
+
+
+def compare_quality(new_path: Path, existing_path: Path
+                    ) -> Tuple[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Decide which of two videos is higher quality.
+
+    Returns (decision, new_info, existing_info). Decision is one of the
+    QUALITY_* constants above. When undecided, callers should fall back
+    to the default (skip the new file) for safety.
+
+    Heuristic: compare (pixels, bit_rate, size_bytes) as a tuple. Same
+    resolution + same bitrate within 5% → keep existing (no point churning).
+    """
+    new_info = ffprobe_video_quality(new_path)
+    ex_info = ffprobe_video_quality(existing_path)
+    if not new_info or not ex_info:
+        return (QUALITY_UNDECIDED, new_info, ex_info)
+
+    new_score = quality_score(new_info)
+    ex_score = quality_score(ex_info)
+
+    # If resolutions differ, that's the decisive factor.
+    if new_score[0] != ex_score[0]:
+        return (QUALITY_REPLACE if new_score[0] > ex_score[0]
+                else QUALITY_KEEP_EXISTING, new_info, ex_info)
+
+    # Same resolution. Look at bitrate next, with a 5% deadband to avoid
+    # churn on near-identical files.
+    new_br = new_score[1]
+    ex_br = ex_score[1]
+    if ex_br > 0:
+        diff_pct = (new_br - ex_br) / ex_br
+        if abs(diff_pct) < 0.05:
+            return (QUALITY_KEEP_EXISTING, new_info, ex_info)
+    if new_br > ex_br:
+        return (QUALITY_REPLACE, new_info, ex_info)
+    return (QUALITY_KEEP_EXISTING, new_info, ex_info)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +584,18 @@ class IntakeTitle:
     target_folder: Path = field(default_factory=lambda: Path(""))
     note: str = ""
     candidates: List[Dict[str, Any]] = field(default_factory=list)  # top alternatives
+    # Variant tags detected in the source filename (see detect_variants).
+    # When set, the target VIDEO filename gets Plex-style suffixes; the
+    # folder leaf itself stays "clean" so Plex groups variants together.
+    edition: str = ""           # "Theatrical", "Extended", "Director's Cut", ...
+    is_3d: bool = False
+    threed_format: str = ""     # "HSBS", "HOU", "FSBS"
+    is_3d_archive: bool = False  # 3D .mkv source — routes to flat 3D-MKV archive
+    # Extras (bonus features) get routed into Movie\Extras\ where Plex
+    # auto-recognizes them as extras for the parent movie.
+    is_extra: bool = False
+    extra_label: str = ""        # "Extra", "Extras", "Extra 2", ...
+    final_video_name: str = ""  # the eventual filename inside target_folder
 
 
 def group_intake(intake_dir: Path) -> List[IntakeTitle]:
@@ -357,16 +649,89 @@ def group_intake(intake_dir: Path) -> List[IntakeTitle]:
 # Identification
 # ---------------------------------------------------------------------------
 
+_IMDB_IN_FILENAME_RX = re.compile(r"\{imdb-(tt\d{7,10})\}", re.IGNORECASE)
+_TMDB_IN_FILENAME_RX = re.compile(r"\{tmdb-(\d+)\}", re.IGNORECASE)
+
+
 def identify_title(t: IntakeTitle, tmdb: TmdbClient) -> None:
     """Populate t with TMDB-derived identification."""
-    # 1. NFO in intake folder?
+    # 0a. Detect edition / 3D markers up front. The IMDB tag detection below
+    # operates on the full filename and still finds {imdb-tt...} correctly;
+    # the cleaned stem is only used for the guessit fallback path.
+    v = detect_variants(t.main_video.stem)
+    t.edition = v.edition
+    t.is_3d = v.is_3d
+    t.threed_format = v.threed_format
+    # 3D source .mkv files go to the flat archive root, not the Plex tree.
+    t.is_3d_archive = v.is_3d and t.main_video.suffix.lower() == ".mkv"
+
+    # 0b. Detect trailing "Extra" / "Extras" / "Extra N" — bonus features
+    # belong inside Movie\Extras\ where Plex auto-recognizes them.
+    # Extras take precedence over 3D-archive routing (a .mkv extra still
+    # belongs in the movie folder's Extras\, not flat 3D-MKV).
+    e = detect_extra(v.cleaned_stem)
+    if e.is_extra:
+        t.is_extra = True
+        t.extra_label = e.extra_label
+        t.is_3d_archive = False
+        cleaned_for_lookup = e.cleaned_stem
+    else:
+        cleaned_for_lookup = v.cleaned_stem
+
+    # 1a. IMDB id already in the filename? (e.g. "Movie (Year) {imdb-tt1234567}.mp4")
+    # This is the most reliable signal — if someone tagged the filename with
+    # an IMDB id, trust it. Never fall through to guessit, even if the TMDB
+    # lookup fails — the user's intent is clear, and falling through risks
+    # producing a wrong fuzzy match.
+    m = _IMDB_IN_FILENAME_RX.search(t.main_video.name)
+    if m:
+        imdb_from_name = m.group(1).lower()
+        if imdb_from_name.startswith("tt"):
+            match = tmdb.find_by_imdb(imdb_from_name)
+            if match:
+                _apply_match(t, match, tmdb, confidence=95)
+                t.note = f"matched via filename imdb {imdb_from_name}"
+                return
+            # Lookup failed. Don't fall through to guessit — the filename
+            # was explicit. Mark as REVIEW with a clear diagnostic.
+            t.imdb_id = imdb_from_name
+            t.confidence = 0
+            t.note = (f"IMDB id {imdb_from_name} from filename did not resolve "
+                      f"to a TMDB record (transient API error, or this id "
+                      f"isn't in TMDB's database — verify on themoviedb.org)")
+            return
+
+    # 1b. TMDB id in the filename? Same stubborn behavior.
+    m = _TMDB_IN_FILENAME_RX.search(t.main_video.name)
+    if m:
+        tmdb_from_name = m.group(1)
+        try:
+            full = tmdb.get_full(int(tmdb_from_name))
+        except (ValueError, sqlite3.Error):
+            full = None
+        if full:
+            synth = {
+                "id": full.get("id"),
+                "title": full.get("title"),
+                "release_date": full.get("release_date"),
+            }
+            _apply_match(t, synth, tmdb, confidence=95)
+            t.note = f"matched via filename tmdb {tmdb_from_name}"
+            return
+        t.tmdb_id = tmdb_from_name
+        t.confidence = 0
+        t.note = (f"TMDB id {tmdb_from_name} from filename did not resolve "
+                  f"(transient API error, or removed from TMDB)")
+        return
+
+    # 1c. NFO in intake folder?
     nfo_path = next((f for f in t.files if f.suffix.lower() == ".nfo"), None)
     if nfo_path:
         imdb, tmdb_id = read_nfo_imdb(nfo_path)
         t.nfo_imdb_id = imdb
         t.nfo_tmdb_id = tmdb_id
 
-    # 2. Try the NFO IMDB id first
+    # 1d. Try the NFO IMDB id
     if t.nfo_imdb_id:
         match = tmdb.find_by_imdb(t.nfo_imdb_id)
         if match:
@@ -374,8 +739,10 @@ def identify_title(t: IntakeTitle, tmdb: TmdbClient) -> None:
             t.note = f"matched via NFO imdb {t.nfo_imdb_id}"
             return
 
-    # 3. Use guessit on the de-noised stem
-    stem = denoise_filename(t.main_video.stem)
+    # 3. Use guessit on the de-noised, variant-stripped, extras-stripped
+    # stem so "Theatrical" / "3D" / "Extra" markers don't bleed into the
+    # TMDB title query.
+    stem = denoise_filename(cleaned_for_lookup)
     if _HAS_GUESSIT:
         try:
             g = guessit(stem, options={"type": "movie"})
@@ -426,7 +793,17 @@ def identify_title(t: IntakeTitle, tmdb: TmdbClient) -> None:
         if rel_year == t.guess_year:
             confidence = 95 if n <= 3 else 85
         else:
-            confidence = 60  # year mismatch — wrong record likely
+            # Tolerate off-by-one year (release-year vs production-year
+            # discrepancy, country-of-release timing, etc.) — still a strong
+            # signal if the title also matches exactly.
+            try:
+                year_delta = abs(int(rel_year) - int(t.guess_year))
+            except (ValueError, TypeError):
+                year_delta = 99
+            if year_delta <= 1 and title_exact:
+                confidence = 85 if n <= 3 else 75
+            else:
+                confidence = 60  # bigger mismatch — likely wrong record
     else:
         if n == 1:
             confidence = 80          # only candidate; trust it
@@ -475,25 +852,74 @@ def _apply_match(t: IntakeTitle, search_result: Dict[str, Any],
 # ---------------------------------------------------------------------------
 
 def compute_target(t: IntakeTitle, cfg: Config) -> Path:
-    """Compute target_folder using the same template as the bulk migration."""
+    """Compute target_folder using the same template as the bulk migration.
+
+    Also populates t.final_video_name, which is the eventual filename of
+    the video inside target_folder. For plain 2D movies the filename is
+    the same as the folder leaf; for editions and 3D versions it picks
+    up Plex-style {edition-X} and ' - 3D.HSBS' suffixes so multiple
+    variants of the same movie can live in the same folder and be
+    grouped by Plex as one library entry.
+    """
     if not t.matched_title or not t.matched_year:
+        t.final_video_name = ""
         return Path("")
+
+    # Base template — either imdb-tagged (preferred) or tmdb fallback.
     if not t.imdb_id:
-        # Fall back to TMDB id if no IMDB
-        leaf_template = "{title} ({year}) {{tmdb-{tmdb_id}}}"
+        base_template = "{title} ({year}) {{tmdb-{tmdb_id}}}"
     else:
-        leaf_template = cfg.filename_template
-    leaf = render_filename_template(leaf_template, {
+        base_template = cfg.filename_template
+
+    fields = {
         "title": t.matched_title,
         "year": t.matched_year,
         "imdb_id": t.imdb_id,
         "tmdb_id": t.tmdb_id,
         "matched_title_lowercase": t.matched_title.lower(),
-    })
+    }
+
+    # Clean folder leaf — same for every variant of a given movie. This is
+    # what causes Plex to group Theatrical + Extended + 3D under one entry.
+    folder_leaf = render_filename_template(base_template, fields)
+    ext = t.main_video.suffix.lower()
+
+    # Compute the movie's home folder once; extras and 3D-archive routing
+    # may override it but the canonical movie folder is still used as the
+    # anchor for Extras\.
     if t.collection_name:
         franchise = sanitize_for_windows(t.collection_name)
-        return _norm_path(str(cfg.movies_root) + "\\" + franchise + "\\" + leaf)
-    return _norm_path(str(cfg.movies_root) + "\\" + leaf)
+        movie_folder = _norm_path(str(cfg.movies_root) + "\\"
+                                  + franchise + "\\" + folder_leaf)
+    else:
+        movie_folder = _norm_path(str(cfg.movies_root) + "\\" + folder_leaf)
+
+    # ---- Extras branch -------------------------------------------------
+    # Bonus features land inside Movie\Extras\ with the Plex-recommended
+    # "<Title> (<Year>) - <Label>.<ext>" name. No NFO, no edition/3D tags
+    # — extras are extras.
+    if t.is_extra:
+        extras_folder = _norm_path(str(movie_folder) + "\\Extras")
+        extra_stem = (f"{t.matched_title} ({t.matched_year}) "
+                      f"- {t.extra_label}")
+        t.final_video_name = sanitize_for_windows(extra_stem) + ext
+        return extras_folder
+
+    # ---- Variant-tagged video filename --------------------------------
+    video_template = template_for_variant(base_template,
+                                          t.edition, t.is_3d, t.threed_format)
+    video_stem = render_filename_template(video_template, fields)
+    t.final_video_name = sanitize_for_windows(video_stem) + ext
+
+    # ---- 3D archive routing -------------------------------------------
+    # 3D source MKVs are kept outside the Plex Movies tree so Plex never
+    # tries to index them. Flat layout per user preference: every archive
+    # mkv lives directly under the configured archive root.
+    if t.is_3d_archive:
+        threed_root_str = cfg.raw.get("threed_mkv_root") or "H:/3D MKV"
+        return _norm_path(threed_root_str)
+
+    return movie_folder
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +1006,20 @@ def print_preview(titles: List[IntakeTitle], cfg: Config) -> None:
             print(f"    Match  : {t.matched_title} ({yr})  tmdb={t.tmdb_id}  imdb={t.imdb_id}")
             if t.collection_name:
                 print(f"    Set    : {t.collection_name}")
-            print(f"    Target : {t.target_folder}")
+            # Variant line — only shown when something was detected, so
+            # plain 2D movies stay uncluttered in the preview.
+            variant_bits: List[str] = []
+            if t.edition:
+                variant_bits.append(f"edition={t.edition}")
+            if t.is_3d:
+                variant_bits.append(f"3D.{t.threed_format or 'HSBS'}")
+            if t.is_3d_archive:
+                variant_bits.append("source-archive (.mkv)")
+            if t.is_extra:
+                variant_bits.append(f"extra ({t.extra_label})")
+            if variant_bits:
+                print(f"    Variant: {', '.join(variant_bits)}")
+            print(f"    Target : {t.target_folder}\\{t.final_video_name}")
         else:
             print(f"    Match  : (none)  guess={t.guess_title!r} year={t.guess_year}")
         if t.note:
@@ -648,14 +1087,26 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--force-low-confidence", action="store_true",
                    help="process titles with confidence < 70 too (default: skip them)")
     p.add_argument("--replace-existing", action="store_true",
-                   help="overwrite the destination if a file already exists there "
-                        "(default: skip; the existing file is preserved)")
+                   help="overwrite the destination even if quality check is inconclusive "
+                        "(default: skip when ffprobe can't decide)")
+    p.add_argument("--no-quality-check", action="store_true",
+                   help="disable ffprobe-based quality comparison for EXISTS collisions; "
+                        "fall back to old skip-by-default behavior")
     p.add_argument("--plex-scan", action="store_true",
                    help="trigger Plex Movies library scan after success")
     p.add_argument("--no-nfo", action="store_true",
                    help="skip NFO writing")
     p.add_argument("--keep-source", action="store_true",
                    help="don't rmdir the empty intake source after move")
+    p.add_argument("--with-art", action="store_true",
+                   help="after processing, fetch posters/fanart/landscape/logo from TMDB")
+    p.add_argument("--with-clearart", action="store_true",
+                   help="after processing, fetch clearart/clearlogo from Fanart.tv "
+                        "(requires fanart_tv_api_key in config.json)")
+    p.add_argument("--with-trailer", action="store_true",
+                   help="after processing, download a trailer via TMDB+YouTube (requires yt-dlp)")
+    p.add_argument("--full", action="store_true",
+                   help="shorthand for --with-art --with-clearart --with-trailer --plex-scan")
     return p.parse_args(argv)
 
 
@@ -711,13 +1162,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         tmdb.close()
 
     # 3a. Detect in-batch collisions — multiple titles in this batch resolving
-    # to the same target_folder. Almost always means the title parsing
-    # produced the same TMDB match for distinct files.
+    # to the same target FILE (folder + filename). Different editions or
+    # 3D variants of the same movie share a folder but have distinct
+    # filenames, so they should NOT collide; the key includes final_video_name.
     target_groups: Dict[str, List[IntakeTitle]] = {}
     for t in titles:
-        if not t.target_folder or str(t.target_folder) in ("", "."):
+        if not t.target_folder or str(t.target_folder) in ("", ".") \
+                or not t.final_video_name:
             continue
-        target_groups.setdefault(str(t.target_folder).lower(), []).append(t)
+        key = (str(t.target_folder) + "\\" + t.final_video_name).lower()
+        target_groups.setdefault(key, []).append(t)
     collided: Set[int] = set()
     for path, group in target_groups.items():
         if len(group) > 1:
@@ -732,38 +1186,89 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 3b. Detect against-existing collisions — the title's target folder
     # already contains a video file from a previous run or the bulk
-    # migration. Without --replace-existing, skip.
+    # migration. For each, run a quality comparison (ffprobe both files)
+    # and tag the decision so phase 4 can route correctly.
     existing_collisions: Set[int] = set()
+    # decision tracker: id(t) -> (decision, existing_video_path)
+    quality_decisions: Dict[int, Tuple[str, Path]] = {}
     for t in titles:
-        if id(t) in collided or not t.target_folder:
+        if id(t) in collided or not t.target_folder or not t.final_video_name:
+            continue
+        # 3D archives and extras don't participate in the quality-comparison
+        # flow. They have a dedicated mover; if the destination is already
+        # taken the move will fail loudly with a clear log line.
+        if t.is_3d_archive or t.is_extra:
             continue
         if not t.target_folder.exists():
             continue
+        # EXISTS fires only on EXACT filename match. Other unrelated videos
+        # in the same folder (e.g. a pre-existing Theatrical when we're
+        # adding Extended) are fine — they're distinct variants.
+        target_video_path = t.target_folder / t.final_video_name
         try:
-            entries = [e for e in os.scandir(long(t.target_folder))
-                       if e.is_file() and Path(e.name).suffix.lower() in VIDEO_EXTS]
+            if not target_video_path.exists():
+                continue
         except OSError:
             continue
-        if entries:
-            existing_video = entries[0].name
+
+        existing_video = target_video_path
+        existing_collisions.add(id(t))
+
+        if args.no_quality_check:
             t.note = (t.note + " | " if t.note else "") + \
-                     f"EXISTS: target folder already contains '{existing_video}' " \
+                     f"EXISTS: target already has '{existing_video.name}' " \
                      f"(use --replace-existing to overwrite)"
-            existing_collisions.add(id(t))
+            quality_decisions[id(t)] = (QUALITY_UNDECIDED, existing_video)
+            continue
+
+        decision, new_info, ex_info = compare_quality(t.main_video, existing_video)
+        quality_decisions[id(t)] = (decision, existing_video)
+        new_q = quality_summary(new_info)
+        ex_q = quality_summary(ex_info)
+        if decision == QUALITY_REPLACE:
+            t.note = (t.note + " | " if t.note else "") + \
+                     f"EXISTS (quality: NEW WINS): new={new_q}; existing={ex_q}. " \
+                     f"New replaces existing; existing → H:\\duplicates\\intake_replaced\\"
+        elif decision == QUALITY_KEEP_EXISTING:
+            t.note = (t.note + " | " if t.note else "") + \
+                     f"EXISTS (quality: KEEP EXISTING): new={new_q}; existing={ex_q}. " \
+                     f"New → H:\\duplicates\\intake_replaced\\"
+        else:
+            t.note = (t.note + " | " if t.note else "") + \
+                     f"EXISTS (quality: UNDECIDED — ffprobe failed on one side): " \
+                     f"target already has '{existing_video.name}'. Defaulting to skip; " \
+                     f"use --replace-existing to overwrite anyway."
+
     if existing_collisions:
-        log.warning("Detected %d title(s) that already exist at the target "
-                    "(prior migration or earlier intake run). They will be "
-                    "skipped unless you use --replace-existing.",
-                    len(existing_collisions))
+        log.info("Detected %d title(s) that already exist at the target. "
+                 "Quality auto-decision is active; see EXISTS notes in preview.",
+                 len(existing_collisions))
 
     # 4. Filter low-confidence unless forced. In-batch collisions are NEVER
-    # auto-processed. Existing-target collisions are skipped unless
-    # --replace-existing is passed.
-    auto_titles = [t for t in titles
-                   if t.matched_title
-                   and id(t) not in collided
-                   and (id(t) not in existing_collisions or args.replace_existing)
-                   and (t.confidence >= 70 or args.force_low_confidence)]
+    # auto-processed. Existing-target collisions follow the quality decision:
+    #   - REPLACE (new is better) → auto-process with archive-then-install
+    #   - KEEP_EXISTING (existing is better or equal) → route source to dups
+    #   - UNDECIDED (ffprobe failed) → skip unless --replace-existing
+    auto_titles = []
+    for t in titles:
+        if not t.matched_title:
+            continue
+        if id(t) in collided:
+            continue
+        if t.confidence < 70 and not args.force_low_confidence:
+            continue
+        if id(t) in existing_collisions:
+            decision, _ = quality_decisions.get(id(t), (QUALITY_UNDECIDED, None))
+            if decision == QUALITY_REPLACE:
+                pass  # let through; phase 7 will archive existing first
+            elif decision == QUALITY_KEEP_EXISTING:
+                pass  # let through; phase 7 will route source to dups
+            elif decision == QUALITY_UNDECIDED and not args.replace_existing:
+                continue
+            elif decision == QUALITY_UNDECIDED and args.replace_existing:
+                # Treat as a forced replace
+                quality_decisions[id(t)] = (QUALITY_REPLACE, quality_decisions[id(t)][1])
+        auto_titles.append(t)
     review_titles = [t for t in titles if t not in auto_titles]
 
     # 5. Preview
@@ -800,29 +1305,142 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     large_extras_log: List[Dict[str, Any]] = []
     orphans_log: List[Dict[str, Any]] = []
+    succeeded_imdb_ids: List[str] = []
     ok = 0
     fail = 0
     for t in auto_titles:
         plan_row = build_plan_row(t)
         inv_files = build_inv_files(t)
-        log.info("[%s] %s -> %s", "DRY" if args.dry_run else "GO",
-                 t.main_video.name, t.target_folder.name)
 
-        # If replacing an existing target, move the old video(s) to
-        # duplicates_dir/intake_replaced/ first so they're preserved.
-        if (id(t) in existing_collisions and args.replace_existing
-                and t.target_folder.exists()):
-            replaced_dir = cfg.duplicates_dir / "intake_replaced" / t.target_folder.name
-            try:
-                for e in os.scandir(long(t.target_folder)):
-                    if e.is_file() and Path(e.name).suffix.lower() in VIDEO_EXTS:
-                        src = _norm_path(e.path)
-                        dst = replaced_dir / src.name
-                        log.info("  Replacing: archiving %s -> %s", src.name, dst)
-                        ops.move(src, dst, title_id=plan_row.title_id,
-                                 stage="REPLACE", op_label="replace_archive")
-            except OSError as e:
-                log.warning("  could not enumerate target folder for replacement: %s", e)
+        # ---- Branch: Extras (bonus feature for an existing movie).
+        # Lands in Movie\Extras\ with Plex's recommended naming. No NFO
+        # is written here — the movie folder's main NFO covers it, and
+        # Plex doesn't need per-extra metadata files.
+        if t.is_extra:
+            target_video_path = plan_row.target_folder / t.final_video_name
+            log.info("[%s] %s -> %s (extras)",
+                     "DRY" if args.dry_run else "GO",
+                     t.main_video.name, target_video_path)
+            extras_ok = ops.mkdir(plan_row.target_folder,
+                                  title_id=plan_row.title_id, stage="B")
+            if extras_ok and target_video_path.exists():
+                log.warning("  Extra already exists, skipping: %s",
+                            target_video_path.name)
+                fail += 1
+                continue
+            if extras_ok:
+                extras_ok = ops.move(
+                    t.main_video, target_video_path,
+                    title_id=plan_row.title_id, stage="C",
+                    op_label="rename" if same_drive(t.main_video,
+                                                    target_video_path)
+                                       else "move",
+                )
+            if extras_ok:
+                ok += 1
+            else:
+                fail += 1
+                log.error("  Extras install failed: %s",
+                          t.main_video.name)
+            continue
+
+        # ---- Branch: 3D source MKV archive (flat layout, no NFO/sidecars).
+        # process_title is bypassed because archives don't need its full
+        # sidecar/NFO stack — they're just raw mkv files we want preserved.
+        if t.is_3d_archive:
+            target_video_path = plan_row.target_folder / t.final_video_name
+            log.info("[%s] %s -> %s (3D source archive)",
+                     "DRY" if args.dry_run else "GO",
+                     t.main_video.name, target_video_path)
+            archive_ok = ops.mkdir(plan_row.target_folder,
+                                   title_id=plan_row.title_id, stage="B")
+            if archive_ok and target_video_path.exists():
+                log.warning("  3D archive already exists, skipping: %s",
+                            target_video_path.name)
+                fail += 1
+                continue
+            if archive_ok:
+                archive_ok = ops.move(
+                    t.main_video, target_video_path,
+                    title_id=plan_row.title_id, stage="C",
+                    op_label="rename" if same_drive(t.main_video,
+                                                    target_video_path)
+                                       else "move",
+                )
+            if archive_ok:
+                ok += 1
+            else:
+                fail += 1
+                log.error("  3D archive install failed: %s",
+                          t.main_video.name)
+            continue
+
+        # Branch on EXISTS quality decision before invoking process_title.
+        if id(t) in existing_collisions:
+            decision, existing_video = quality_decisions.get(
+                id(t), (QUALITY_UNDECIDED, None))
+
+            if decision == QUALITY_KEEP_EXISTING:
+                # Existing is better. New source(s) go to duplicates;
+                # target folder is left untouched (artwork preserved).
+                log.info("[%s] %s -> H:\\duplicates\\ (existing is higher quality)",
+                         "DRY" if args.dry_run else "GO", t.main_video.name)
+                dup_root = cfg.duplicates_dir / "intake_replaced" / t.target_folder.name
+                ok_all = True
+                for f in t.files:
+                    dst = dup_root / f.name
+                    if not ops.move(f.abs_path if hasattr(f, "abs_path") else f,
+                                    dst, title_id=plan_row.title_id,
+                                    stage="QUALITY_KEEP", op_label="dup_intake"):
+                        ok_all = False
+                # Try to rmdir the source folder if it's not the intake root
+                if t.folder.exists() and t.folder != intake_dir:
+                    ops.rmdir(t.folder, title_id=plan_row.title_id,
+                              stage="QUALITY_KEEP")
+                if ok_all:
+                    ok += 1
+                else:
+                    fail += 1
+                continue  # don't run process_title
+
+            elif decision == QUALITY_REPLACE or (
+                    decision == QUALITY_UNDECIDED and args.replace_existing):
+                # New is better (or --replace-existing forces). Archive
+                # existing video(s) first; artwork sidecars in the target
+                # folder stay put (so Plex's existing posters/fanart aren't
+                # disturbed).
+                log.info("[%s] %s -> %s (replacing — new is higher quality)",
+                         "DRY" if args.dry_run else "GO",
+                         t.main_video.name, t.target_folder.name)
+                replaced_dir = cfg.duplicates_dir / "intake_replaced" / t.target_folder.name
+                try:
+                    for e in os.scandir(long(t.target_folder)):
+                        if e.is_file() and Path(e.name).suffix.lower() in VIDEO_EXTS:
+                            src = _norm_path(e.path)
+                            dst = replaced_dir / src.name
+                            log.info("  archiving %s -> %s", src.name, dst)
+                            ops.move(src, dst, title_id=plan_row.title_id,
+                                     stage="REPLACE", op_label="replace_archive")
+                except OSError as e:
+                    log.warning("  could not enumerate target folder for replacement: %s", e)
+                # Fall through to process_title to install the new video
+
+        else:
+            log.info("[%s] %s -> %s", "DRY" if args.dry_run else "GO",
+                     t.main_video.name, t.target_folder.name)
+
+        # Variant-aware filename: if this title has edition/3D tags, build a
+        # per-call template so process_title's internal stem rendering picks
+        # up "{edition-Extended}" or "- 3D.HSBS". The folder leaf is still
+        # the clean canonical name (compute_target ensures that), so
+        # variants of the same movie share a folder and Plex groups them.
+        saved_template = cfg.filename_template
+        if t.edition or t.is_3d:
+            base_template = (cfg.filename_template if t.imdb_id
+                             else "{title} ({year}) {{tmdb-{tmdb_id}}}")
+            cfg.filename_template = template_for_variant(
+                base_template, t.edition, t.is_3d, t.threed_format,
+            )
 
         try:
             result = process_title(plan_row, inv_files, cfg, ops, rich,
@@ -831,8 +1449,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             log.exception("title %s crashed: %s", plan_row.title_id, e)
             fail += 1
             continue
+        finally:
+            cfg.filename_template = saved_template
+
         if result.success:
             ok += 1
+            if t.imdb_id:
+                succeeded_imdb_ids.append(t.imdb_id)
         else:
             log.error("FAILED at stage %s: %s", result.error_stage, result.error)
             fail += 1
@@ -846,7 +1469,51 @@ def main(argv: Optional[List[str]] = None) -> int:
     log.info("Summary: %d processed, %d failed (mode=%s)",
              ok, fail, "dry-run" if args.dry_run else "apply")
 
-    # 8. Optional Plex scan
+    # 8. Post-processing enrichment (artwork, clearart, trailers).
+    # Each enrichment is targeted at JUST the new titles via --imdb so we
+    # don't waste time re-walking the whole library.
+    if args.full:
+        args.with_art = args.with_clearart = args.with_trailer = True
+        args.plex_scan = True
+
+    do_enrich = (args.with_art or args.with_clearart or args.with_trailer) \
+                 and succeeded_imdb_ids and not args.dry_run
+    if do_enrich:
+        imdb_csv = ",".join(succeeded_imdb_ids)
+        log.info("")
+        log.info("Enriching %d new title(s) ...", len(succeeded_imdb_ids))
+        import subprocess
+        script_dir = Path(__file__).parent
+        if args.with_art:
+            log.info("  → art_fetch.py")
+            try:
+                subprocess.run([sys.executable,
+                                str(script_dir / "art_fetch.py"),
+                                "--config", args.config,
+                                "--imdb", imdb_csv], check=False)
+            except OSError as e:
+                log.warning("art_fetch.py invocation failed: %s", e)
+        if args.with_clearart:
+            log.info("  → clearart_fetch.py")
+            try:
+                subprocess.run([sys.executable,
+                                str(script_dir / "clearart_fetch.py"),
+                                "--config", args.config,
+                                "--imdb", imdb_csv], check=False)
+            except OSError as e:
+                log.warning("clearart_fetch.py invocation failed: %s", e)
+        if args.with_trailer:
+            log.info("  → trailer_fetch.py")
+            try:
+                subprocess.run([sys.executable,
+                                str(script_dir / "trailer_fetch.py"),
+                                "--config", args.config,
+                                "--imdb", imdb_csv,
+                                "--youtube-search-fallback"], check=False)
+            except OSError as e:
+                log.warning("trailer_fetch.py invocation failed: %s", e)
+
+    # 9. Optional Plex scan (last, so it picks up artwork too)
     if args.plex_scan and ok and not args.dry_run:
         log.info("Triggering Plex scan ...")
         try:

@@ -56,11 +56,11 @@ In Plex Web: **Settings → Library → Scan my library automatically → OFF** 
 
 ## 2. Project setup
 
-Pick a project folder. I'll assume `C:\Users\kg4dk\movie-cleanup\` for examples.
+Pick a project folder. I'll assume `C:\Users\xxxx\movie-cleanup\` for examples.
 
 ```powershell
-mkdir C:\Users\kg4dk\movie-cleanup
-cd C:\Users\kg4dk\movie-cleanup
+mkdir C:\Users\xxxx\movie-cleanup
+cd C:\Users\xxxx\movie-cleanup
 ```
 
 Copy these files into that folder:
